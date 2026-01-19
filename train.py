@@ -10,6 +10,9 @@ from torch.utils.data import DataLoader
 import numpy as np
 import matplotlib.pyplot as plt
 
+import sys
+sys.path.append(str(Path(__file__).parent.parent.resolve()))
+
 from src.datasets.monusac_dataset import MoNuSACGridPatchDataset
 from scripts.export_manifest_dataset import ExportManifestDataset, ExportManifestConfig
 from scripts.model import UNetMultiHead
@@ -35,6 +38,14 @@ OVERFIT_MODE = "debug" # "debug" or "tune"
 
 BASE_SEED = 1337
 PAD_MODE = "reflect"
+
+SEM_CLASS_NAMES = {
+    0: "background",
+    1: "epithelial",
+    2: "lymphocyte",
+    3: "neutrophil",
+    4: "macrophage",
+}
 
 def get_device(force: str | None = None) -> torch.device:
     """
@@ -424,6 +435,61 @@ def semantic_iou_fg(sem_logits: torch.Tensor, sem_gt: torch.Tensor, classes=(1,2
     per_img_miou = torch.stack(per_img_miou)    # [B]
     return per_img_miou, micro_inter, micro_union
 
+@torch.no_grad()
+def semantic_dice_per_class(
+    sem_logits: torch.Tensor,           # [B,5,H,W]
+    sem_gt: torch.Tensor,               # [B,H,W] in {0..4}
+    classes=(1,2,3,4),
+    fg_only: bool = True,               # only evaluate on GT-foreground pixels
+    eps: float = 1e-6,
+):
+    """
+    Returns:
+        - dice_macro: dict[class_.float] (mean of per-image dice; skips images where GT for that class absent)
+        - dice_micro: dict[class->float] (global dice across all pixels/images)
+    """
+    pred = torch.argmax(sem_logits, dim=1)      # [B,H,W]
+
+    if fg_only:
+        region = (sem_gt > 0)                   # evaluate only where GT is foreground
+    else:
+        region = torch.ones_like(sem_gt, dtype=torch.bool)
+
+    dice_macro = {}
+    dice_micro = {}
+
+    for c in classes:
+        # macro: average per-image dice (skip images without GT pixels for that class)
+        per_img = []
+        for b in range(pred.shape[0]):
+            gt_c = (sem_gt[b] == c) & region[b]
+            if gt_c.sum() == 0:
+                continue # skip: class not present in GT for this image
+            pred_c = (pred[b] == c) & region[b]
+            inter = (pred_c & gt_c).sum().float()
+            ps = pred_c.sum().float()
+            gs = gt_c.sum().float()
+            per_img.append(_dice_from_stats(inter, ps, gs, eps))
+
+        dice_macro[c] = float(torch.stack(per_img).mean().item()) if len(per_img) > 0 else 0.0
+
+        # micro: global dice for class c across all pixels/images in region
+        gt_c_all = (sem_gt == c) & region
+        pred_c_all = (pred == c) & region
+        inter = (pred_c_all & gt_c_all).sum().float()
+        ps = pred_c_all.sum().float()
+        gs = gt_c_all.sum().float()
+        dice_micro[c] = float(_dice_from_stats(inter, ps, gs, eps).item())
+
+    return dice_macro, dice_micro
+
+def format_per_class_named(d: dict[int, float], names: dict[int, str]) -> str:
+    parts = []
+    for k in sorted(d.keys()):
+        label = names.get(k, f"class{k}")
+        parts.append(f"{label}:{d[k]:.4f}")
+    return " ".join(parts)
+
 @dataclass
 class PlateauStopper:
     patience: int = 20          # epochs without meaningful improvement
@@ -608,12 +674,46 @@ def evaluate(model, dl, sem_class_weights, ce_ter, device, lam: float):
     
     acc = MetricAccumulator()
 
+    # per-class semantic dice accumulators
+    sem_classes = (1,2,3,4)
+
+    sem_dice_macro_sum = {c: 0.0 for c in sem_classes}
+    sem_dice_macro_n = {c: 0 for c in sem_classes}
+
+    sem_dice_micro_inter = {c: 0.0 for c in sem_classes}
+    sem_dice_micro_ps = {c: 0.0 for c in sem_classes}
+    sem_dice_micro_gs = {c: 0.0 for c in sem_classes}
+
     for x, sem, ter in dl:
         x = x.to(device)
         sem = sem.to(device)
         ter = ter.to(device)
 
         sem_logits = model(x) # ter_logits removed
+
+        pred = torch.argmax(sem_logits, dim=1)      # [B,H,W]
+        region = (sem > 0)                          # fg_only=True
+
+        for c in sem_classes:
+            # micro accumulators
+            gt_c_all = (sem == c) & region
+            pr_c_all = (pred == c) & region
+            sem_dice_micro_inter[c] += float((gt_c_all & pr_c_all).sum().item())
+            sem_dice_micro_ps[c]    += float(pr_c_all.sum().item())
+            sem_dice_micro_gs[c]    += float(gt_c_all.sum().item())
+
+            # macro accumulators (per-image dice, skip image w/out GT class)
+            for b in range(pred.shape[0]):
+                gt_c = (sem[b] == c) & region[b]
+                if gt_c.sum() == 0:
+                    continue
+                pr_c = (pred[b] == c) & region[b]
+                inter = (pr_c & gt_c).sum().float()
+                ps = pr_c.sum().float()
+                gs = gt_c.sum().float()
+                d = _dice_from_stats(inter, ps, gs, eps=1e-6)
+                sem_dice_macro_sum[c] += float(d.item())
+                sem_dice_macro_n[c] += 1
 
         ter_logits = torch.zeros_like(sem_logits[:, :3, :, :], device=device)  # dummy ter_logits for loss calculation
 
@@ -638,6 +738,10 @@ def evaluate(model, dl, sem_class_weights, ce_ter, device, lam: float):
         # metrics
         dice_fg_b, dice_in_b, dice_bd_b = ternary_dice_breakdown(ter_logits, ter)
         miou_fg_b, micro_inter, micro_union = semantic_iou_fg(sem_logits, sem, classes=(1,2,3,4))
+        # per-class semantic dice (classes 1..4 by default)
+        dice_sem_macro, dice_sem_micro = semantic_dice_per_class(
+            sem_logits, sem, classes=(1,2,3,4), fg_only=True
+        )
         acc.update_batch(dice_fg_b, dice_in_b, dice_bd_b, miou_fg_b, micro_inter, micro_union)
 
     loss_sem_mean = loss_sem_sum / max(1, n_patches)
@@ -647,12 +751,30 @@ def evaluate(model, dl, sem_class_weights, ce_ter, device, lam: float):
     macro = acc.macro_means()
     sem_miou_micro = acc.sem_micro_iou()
 
+    dice_sem_macro_by_class = {
+        c: (sem_dice_macro_sum[c] / max(1, sem_dice_macro_n[c]))
+        for c in sem_classes
+    }
+    dice_sem_micro_by_class = {
+        c: float(_dice_from_stats(
+            torch.tensor(sem_dice_micro_inter[c], device=device),
+            torch.tensor(sem_dice_micro_ps[c], device=device),
+            torch.tensor(sem_dice_micro_gs[c], device=device),
+            eps=1e-6,
+        ).item())
+        for c in sem_classes
+    }
+
     return {
         "loss_sem": loss_sem_mean,
         "loss_total": loss_total_mean,
         "loss_ter": loss_ter_mean,
         **macro,
         "miou_fg_micro": sem_miou_micro,
+
+        # per-class semantic dice (macro + micro)
+        "dice_sem_macro_by_class": dice_sem_macro,
+        "dice_sem_micro_by_class": dice_sem_micro,
     }
 
 
@@ -1056,6 +1178,8 @@ def quick_batch_diag(dl, device, name="val_dl"):
         raise RuntimeError(f"[DIAG FAIL] sem labels out of range: [{sem_min}, {sem_max}]")
     if ter_min < 0 or ter_max > 2:
         raise RuntimeError(f"[DIAG FAIL] ter labels out of range: [{ter_min}, {ter_max}]")
+    
+
 
 def main():
     # reproducibility
@@ -1080,15 +1204,15 @@ def main():
     collapse_thresh = 0.995
 
     # Overfit test (gate)
-    OVERFIT = True          # <- flip to False for real training
+    OVERFIT = False         # <- flip to False for real training
     OVERFIT_N = 16          # 8, 16, 32
     OVERFIT_EPOCHS = 300    # 200-500 is typical
 
-    max_epochs = OVERFIT_EPOCHS if OVERFIT else 600
+    max_epochs = OVERFIT_EPOCHS if OVERFIT else 1200
     epochs_planned = max_epochs
-    plateau_patience = 25
+    plateau_patience = 80
     plateau_min_delta = 5e-4
-    plateau_min_epochs = 40
+    plateau_min_epochs = 120
 
     resume = False # set true to continue a run
     resume_from = None
@@ -1109,6 +1233,9 @@ def main():
 
     preview_dir = Path("MoNuSAC_outputs/preview") / run_name
     preview_dir.mkdir(parents=True, exist_ok=True)
+
+    SAVE_EPOCH_END_PREVIEW = True
+    EPOCH_END_PREVIEW_TAG = "epoch_end"
 
     runs_dir = Path("MoNuSAC_outputs/runs") / run_name
     runs_dir.mkdir(parents=True, exist_ok=True)
@@ -1189,6 +1316,11 @@ def main():
     
     quick_batch_diag(val_dl, device, name="val_dl")
 
+    x0, sem0, ter0 = next(iter(val_dl))
+    uniq = torch.unique(sem0).cpu().tolist()
+    print("[SEM] unique class ids in GT:", uniq)
+    print("[SEM] names:", {u: SEM_CLASS_NAMES.get(u, "UNKNOWN") for u in uniq})
+
     # ---------------------------------------------------------------------
     # ---- Deterministic single monitor patch (B=1), persisted to disk ----
     # ---------------------------------------------------------------------
@@ -1262,6 +1394,15 @@ def main():
     assert monitor_x.size(0) == 1 and monitor_sem.size(0) == 1 and monitor_ter.size(0) == 1, \
             f"Expected monitor tensors to have batch size 1, got: x={tuple(monitor_x.shape)} sem={tuple(monitor_sem.shape)} ter={tuple(monitor_ter.shape)}"
     
+    @torch.no_grad()
+    def save_epoch_end_preview(tag: str):
+        model.eval()
+        sem_logits_m = model(monitor_x)
+        out_path = preview_dir / f"{tag}__epoch{epoch:03d}_step{global_step:06d}.png"
+        save_preview_panel(out_path, monitor_x, monitor_sem, monitor_ter, sem_logits_m, b=0)
+        print(f"[PREVIEW] Saved epoch-end preview: {out_path}")
+        model.train()
+    
     # ---------------------------------------------------------------------
     # ------------------------ END
     # ---------------------------------------------------------------------
@@ -1296,7 +1437,7 @@ def main():
     ENCODER_WEIGHTS = 'imagenet'
     IN_CHANNELS = 3  # For RGB images
     CLASSES = 5
-    ACTIVATION = 'softmax' # For binary, 'softmax' for multiclass
+    ACTIVATION = None #'softmax' # For binary, 'softmax' for multiclass
 
     # Create the U-Net model
     model = smp.Unet(
@@ -1375,7 +1516,11 @@ def main():
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode="min", factor=0.5, patience=8, threshold=plateau_min_delta
+        opt,
+        mode="min",
+        factor=0.5,
+        patience=20,
+        threshold=plateau_min_delta
     )
 
     best_selection = float("-inf")  # maximize selection_score (higher is better)
@@ -1549,7 +1694,7 @@ def main():
                 with torch.no_grad():
                     sem_logits_m = model(monitor_x) # removed ter head: ter_logits_m
                 out_path = preview_dir / f"epoch{epoch:02d}_step{global_step:06d}.png"
-                save_preview_panel(out_path, monitor_x, monitor_sem, monitor_ter, sem_logits_m, None, b=0) # removed ter head: ter_logits_m
+                save_preview_panel(out_path, monitor_x, monitor_sem, monitor_ter, sem_logits_m, b=0)        # removed ter head: ter_logits_m
                 print(f"Saved preview: {out_path}")
                 model.train()
 
@@ -1561,9 +1706,14 @@ def main():
 
             if step % 50 == 0:
                 print(
-                    f"epoch {epoch} step {step:04d} | "
-                    f"loss_sem {run_sem/seen:.4f} | loss_ter {run_ter/seen:.4f} | total {run_total/seen:.4f}"
+                    f"epoch {epoch} step {step:04d}\n"
+                    f"loss_sem {run_sem/seen:.4f}\n"
+                    f"loss_ter {run_ter/seen:.4f}\n"
+                    f"total {run_total/seen:.4f}\n"
                 )
+
+        # if OVERFIT and SAVE_EPOCH_END_PREVIEW and (epoch == max_epochs):
+        #     save_epoch_end_preview("FINAL_EPOCH")
 
         train_sem = run_sem / max(1, seen)
         train_ter = run_ter / max(1, seen)
@@ -1656,23 +1806,80 @@ def main():
         
         append_metrics_row(metrics_csv, row)
 
-        print(
-            f"\nEPOCH {epoch} DONE\n"
-            f"  train:  sem {train_sem:.4f} | ter {train_ter:.4f} | total {train_total:.4f}"
-        )
+        print(f"\n===== EPOCH {epoch} SUMMARY =====")
 
-        # always print gate metrics
-        print(
-            f"   gate:    sem {gate['loss_sem']:.4f} | ter {gate['loss_ter']:.4f} | total {gate['loss_total']:.4f} | "
-            f"dice_fg {gate['dice_fg_macro']:.4f} | miou_fg macro {gate['miou_fg_macro']:.4f} | miou_fg micro {gate['miou_fg_micro']:.4f}"
-        )
+        print("\n-- TRAIN LOSSES --")
+        print(f"train_sem_loss:   {train_sem:.4f}")
+        print(f"train_ter_loss:   {train_ter:.4f}")
+        print(f"train_total_loss: {train_total:.4f}")
 
-        # only print true validation metrics during overfit
+        print("\n-- GATE / EVAL LOSSES --")
+        print(f"semantic_loss: {gate['loss_sem']:.4f}")
+        print(f"ternary_loss:  {gate['loss_ter']:.4f}")
+        print(f"total_loss:    {gate['loss_total']:.4f}")
+
+        print("\n-- TERNARY METRICS (foreground / instance separation) --")
+        print(f"dice_fg_macro:       {gate['dice_fg_macro']:.4f}")
+        print(f"dice_inside_macro:   {gate['dice_inside_macro']:.4f}")
+        print(f"dice_boundary_macro: {gate['dice_boundary_macro']:.4f}")
+
+        print("\n-- SEMANTIC METRICS (nucleus typing) --")
+        print(f"miou_fg_macro: {gate['miou_fg_macro']:.4f}")
+        print(f"miou_fg_micro: {gate['miou_fg_micro']:.4f}")
+
+        print("\nPer-class SEMANTIC DICE (macro):")
+        print(format_per_class_named(gate["dice_sem_macro_by_class"], SEM_CLASS_NAMES))
+
+        print("\nPer-class SEMANTIC DICE (micro):")
+        print(format_per_class_named(gate["dice_sem_micro_by_class"], SEM_CLASS_NAMES))
+
         if OVERFIT:
-            print(
-                f"  val : sem {val_metrics['loss_sem']:.4f} | ter {val_metrics['loss_ter']:.4f} | total {val_metrics['loss_total']:.4f} | "
-                f"dice_fg {val_metrics['dice_fg_macro']:.4f} | miou_fg_macro {val_metrics['miou_fg_macro']:.4f} | miou_fg micro {val_metrics['miou_fg_micro']:.4f}"
-            )
+            print("\n-- VALIDATION METRICS --")
+            print(f"val_sem_loss:   {val_metrics['loss_sem']:.4f}")
+            print(f"val_ter_loss:   {val_metrics['loss_ter']:.4f}")
+            print(f"val_total_loss: {val_metrics['loss_total']:.4f}")
+
+            print("\nTERNARY:")
+            print(f"dice_fg_macro:       {val_metrics['dice_fg_macro']:.4f}")
+            print(f"dice_inside_macro:   {val_metrics['dice_inside_macro']:.4f}")
+            print(f"dice_boundary_macro: {val_metrics['dice_boundary_macro']:.4f}")
+
+            print("\nSEMANTIC:")
+            print(f"miou_fg_macro: {val_metrics['miou_fg_macro']:.4f}")
+            print(f"miou_fg_micro: {val_metrics['miou_fg_micro']:.4f}")
+
+            print("\nPer-class SEMANTIC DICE (val, macro):")
+            print(format_per_class_named(val_metrics["dice_sem_macro_by_class"], SEM_CLASS_NAMES))
+        
+        # print(f"\nEPOCH {epoch} DONE\n")
+
+        # print(
+        #     f"  train metrics for EPOCH {epoch}:\n"
+        #     f"  sem {train_sem:.4f}\n"
+        #     f"  ter {train_ter:.4f}\n"
+        #     f"  total {train_total:.4f}\n"
+        # )
+
+        # # always print gate metrics
+        # print(
+        #     f"  gate metrics for EPOCH {epoch}:\n"
+        #     f"  sem {gate['loss_sem']:.4f}\n"
+        #     f"  ter {gate['loss_ter']:.4f}\n"
+        #     f"  total {gate['loss_total']:.4f}\n"
+        #     f"  dice_fg {gate['dice_fg_macro']:.4f} | miou_fg macro {gate['miou_fg_macro']:.4f} | miou_fg micro {gate['miou_fg_micro']:.4f}"
+        # )
+
+        # # Per-class semantic dice reporting
+        # print("     gate dice_sem_macro_by_class:",
+        #     format_per_class_named(gate["dice_sem_macro_by_class"], SEM_CLASS_NAMES))
+        # print("     gate dice_sem_micro_by_class:",
+        #       format_per_class_named(gate["dice_sem_micro_by_class"], SEM_CLASS_NAMES))
+        
+        # # only print true validation metrics during overfit
+        # if OVERFIT:
+        #     print(
+        #         f"  val : sem {val_metrics['loss_sem']:.4f} | ter {val_metrics['loss_ter']:.4f} | total {val_metrics['loss_total']:.4f} | "
+        #         f"dice_fg {val_metrics['dice_fg_macro']:.4f} | miou_fg_macro {val_metrics['miou_fg_macro']:.4f} | miou_fg micro {val_metrics['miou_fg_micro']:.4f}"
 
         # pick which metrics drive "best" checkpoint selection
         if OVERFIT:
@@ -1763,7 +1970,7 @@ def main():
         # print("[MON] PR frac:", pr_frac)
         # print(f"[MON] collapsed={collapsed}")
         
-        print(f"[BEST] selection_score={score:.6f} | best={best_selection:.6f}") # ternary_frac={ternary_frac_monitor} | collapsed={collapsed}")
+        print(f"\n[BEST] selection_score={score:.6f} | best={best_selection:.6f}\n") # ternary_frac={ternary_frac_monitor} | collapsed={collapsed}")
 
         # # If GT has lots of 0 but PR has ~0 of 0 -> ternary effectively never predicting background
         # # Test swapped mapping (swap pred labels)
@@ -1989,6 +2196,8 @@ def main():
         ####    
 
         if should_stop:
+            if OVERFIT and SAVE_EPOCH_END_PREVIEW:
+                save_epoch_end_preview("STOPPED_FINAL")
             print(f"Stopping: plateau detected at epoch {epoch}.")
             break
 
