@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler
 
 import numpy as np
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as pltx
 
 import sys
 from dataclasses import dataclass
